@@ -12,7 +12,7 @@ import traceback
 import urllib
 
 from marionette.errors import MarionetteException
-from marionette import Marionette, HTMLElement
+from marionette import Marionette, HTMLElement, Actions
 from mozprofile.profile import Profile
 from mozrunner.runner import FirefoxRunner
 
@@ -38,6 +38,7 @@ class SeleniumRequestServer(BaseHTTPServer.HTTPServer):
 class SeleniumRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
     pathRe = re.compile(r'/session/(.*?)($|/((\w+/(.*?)/)?(.*)))')
+    staged_file = None
 
     def server_error(self, error):
         self.send_response(500)
@@ -86,9 +87,23 @@ class SeleniumRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
         return path, body, session, element
 
+    def convert_marionette_to_wire(self, obj):
+        def element_to_ref(el):
+            if isinstance(el, HTMLElement):
+                return {"ELEMENT":el.id}
+            return el
+
+        if isinstance(obj, dict):
+            obj.update((key, element_to_ref(value)) for key, value in obj.items())
+        elif isinstance(obj, list):
+            obj = [element_to_ref(i) for i in obj]
+        else:
+            obj = element_to_ref(obj)
+
+        return obj
+
     def do_DELETE(self):
         try:
-
             path, body, session, element = self.process_request()
             logger.debug("%s - %s - %s - %s" % (path, body, session, element))
 
@@ -102,15 +117,15 @@ class SeleniumRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             elif path == '/window':
                 logger.info("Closing the window - %s" % session)
                 assert(session)
-                assert(self.server.marionette.close_window())
+                assert(self.server.marionette.close())
                 self.send_JSON(session=session)
             else:
-                logger.error("Unknown path - %s" % session)
+                logger.error("Unknown path - %s" % path)
                 self.file_not_found()
 
         except MarionetteException as e:
-            logger.error("Status: %s - Message: %s" % (e.status, e.message))
-            self.send_JSON(data={'status': e.status}, value={'message': e.message})
+            logger.info("Sending status code - %s - Message: %s" % (e.status, e.message))
+            self.send_JSON(session=session, data={"status":e.status}, value={"message":e.message})
         except:
             trace_ = traceback.format_exc()
             logger.critical("Server Exception: %s" % trace_)
@@ -118,46 +133,70 @@ class SeleniumRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-
             path, body, session, element = self.process_request()
             logger.debug("%s - %s - %s - %s" % (path, body, session, element))
 
             if path.startswith('/attribute/'):
-                logger.info("Getting Attribute %s - %s" % (element, session)) 
+                logger.info("Getting Attribute %s - %s" % (element, session))
                 assert(session)
                 name = path[len('/attribute/'):]
                 marionette_element = HTMLElement(self.server.marionette, element)
                 self.send_JSON(session=session,
                                value=marionette_element.get_attribute(name))
             elif path == '/displayed':
-                logger.info("Displayed %s - %s" % (element, session)) 
+                logger.info("Displayed %s - %s" % (element, session))
                 assert(session)
                 marionette_element = HTMLElement(self.server.marionette, element)
                 self.send_JSON(session=session,
                                value=marionette_element.is_displayed())
             elif path == '/enabled':
-                logger.info("Enabled %s - %s" % (element, session)) 
+                logger.info("Enabled %s - %s" % (element, session))
                 assert(session)
                 marionette_element = HTMLElement(self.server.marionette, element)
                 self.send_JSON(session=session,
-                               value=marionette_element.enabled())
+                               value=marionette_element.is_enabled())
+            elif path == "/location":
+                logger.info("Location %s - %s" % (element, session))
+                assert(session)
+                marionette_element = HTMLElement(self.server.marionette, element)
+                self.send_JSON(session=session, value=marionette_element.location)
             elif path.startswith('/equals/'):
                 assert(session)
                 other = path[len('/equals'):]
                 marionette_element = HTMLElement(self.server.marionette, element)
                 other_element = HTMLElement(self.server.marionette, other)
                 self.send_JSON(session=session,
-                               value=marionette_element.equals(other_element))
+                               value=marionette_element == other_element)
             elif path == '/selected':
-                logger.info("Selected %s - %s" % (element, session)) 
+                logger.info("Selected %s - %s" % (element, session))
                 assert(session)
                 marionette_element = HTMLElement(self.server.marionette, element)
                 self.send_JSON(session=session,
-                               value=marionette_element.selected())
+                               value=marionette_element.is_selected())
+            elif path == "/size":
+                logger.info("Getting element size %s - %s" % (element, session))
+                assert(session)
+                marionette_element = HTMLElement(self.server.marionette, element)
+                self.send_JSON(session=session, value=marionette_element.size)
+            elif path.startswith("/css/"):
+                property = path.split("/")[2]
+                assert(session)
+                marionette_element = HTMLElement(self.server.marionette, element)
+                self.send_JSON(session=session,
+                               value=marionette_element.value_of_css_property(property))
+            elif path == "/screenshot":
+                logger.info("Taking screenshot - %s" % session)
+                assert(session)
+                self.send_JSON(session=session, value=marionette.screenshot())
             elif path == '/status':
-                self.send_JSON(data=self.server.marionette.status())
+                data = {}
+                try:
+                    data = self.server.marionette.status()
+                except Exception:
+                    pass
+                self.send_JSON(data=data)
             elif path == '/text':
-                logger.info("Getting text %s - %s" % (element, session)) 
+                logger.info("Getting text %s - %s" % (element, session))
                 assert(session)
                 marionette_element = HTMLElement(self.server.marionette, element)
                 self.send_JSON(session=session,
@@ -178,23 +217,29 @@ class SeleniumRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self.send_JSON(session=session,
                                value=self.server.marionette.window_handles)
             elif path == '/title':
-                logger.info("Getting Window Title")
+                logger.info("Getting Window Title - %s" % session)
                 assert(session)
-                self.send_JSON(session=session,
-                            value=self.server.marionette.title)
+                self.send_JSON(session=session, value=self.server.marionette.title)
             elif path == "/name":
-                logger.info("Getting element tag name")
+                logger.info("Getting element tag name - %s" % session)
                 assert(session)
                 marionette_element = HTMLElement(self.server.marionette, element)
                 self.send_JSON(session=session,
                             value=marionette_element.tag_name)
+            elif path == "/source":
+                logger.info("Getting page source - %s" % session)
+                assert(session)
+                self.send_JSON(session=session, value=self.server.marionette.page_source)
+            elif path == "/cookie":
+                logger.info("Getting all cookies - %s" % session)
+                assert(session)
+                self.send_JSON(session=session, value=self.server.marionette.get_cookies())
             else:
-                logger.error("Unknown path - %s" % session)
+                logger.error("Unknown path - %s" % path)
                 self.file_not_found()
-
         except MarionetteException as e:
-            logger.error("Status: %s - Message: %s" % (e.status, e.message))
-            self.send_JSON(data={'status': e.status}, value={'message': e.message})
+            logger.info("Sending status code - %s - Message: %s" % (e.status, e.message))
+            self.send_JSON(session=session, data={"status":e.status}, value={"message":e.message})
         except:
             trace_ = traceback.format_exc()
             logger.critical("Server Exception: %s" % trace_)
@@ -211,6 +256,11 @@ class SeleniumRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 assert(session)
                 assert(self.server.marionette.go_back())
                 self.send_JSON(session=session)
+            elif path == "/element/active":
+                logger.info("Getting active element - %s" % session)
+                assert(session)
+                self.send_JSON(session=session,
+                               value={"ELEMENT": self.server.marionette.get_active_element().id})
             elif path == '/clear':
                 logger.info("Clearing %s - %s" % (element, session))
                 assert(session)
@@ -225,14 +275,14 @@ class SeleniumRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self.send_JSON(session=session)
             elif path == '/element':
                 logger.info("Find Element using - %s, value - %s  - %s" \
-                            % (body['using'], body['value'], session)) 
+                            % (body['using'], body['value'], session))
                 # find element variants
                 assert(session)
                 self.send_JSON(session=session,
                                value={'ELEMENT': self.server.marionette.find_element(body['using'], body['value'], id=element).id})
             elif path == '/elements':
                 logger.info("Find Elements using - %s, value - %s  - %s" \
-                            % (body['using'], body['value'], session)) 
+                            % (body['using'], body['value'], session))
                 # find elements variants
                 assert(session)
                 self.send_JSON(session=session,
@@ -240,21 +290,34 @@ class SeleniumRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             elif path == '/execute':
                 logger.info("Executing Script - %s" % session)
                 assert(session)
-                if body['args']:
-                    result = self.server.marionette.execute_script(body['script'], script_args=body['args'],
-                                                            new_sandbox=False)
+
+                print("SCRIPT: %s" % body["script"])
+
+                if body["args"]:
+                    result = self.server.marionette.execute_script(body['script'], script_args=body['args'], new_sandbox=False)
                 else:
-                    result = self.server.marionette.execute_script(body['script'],new_sandbox=False)
-                self.send_JSON(session=session, value=result)
+                    result = self.server.marionette.execute_script(body['script'], new_sandbox=False)
+
+                print("RESULT: %s" % result)
+
+                rv = self.convert_marionette_to_wire(result)
+                print("RV: %s" % rv)
+
+                self.send_JSON(session=session, value=rv)
             elif path == '/execute_async':
                 logger.info("Executing Async Script - %s" % session)
                 assert(session)
                 result = None
-                if body['args']:
+
+                if body["args"]:
                     result = self.server.marionette.execute_async_script(body['script'], script_args=body['args'], new_sandbox=False)
                 else:
                     result = self.server.marionette.execute_async_script(body['script'], new_sandbox=False)
-                self.send_JSON(session=session, value=result)
+
+                rv = self.convert_marionette_to_wire(result)
+                print("RV: %s" % rv)
+
+                self.send_JSON(session=session, value=rv)
             elif path == '/forward':
                 logger.info("Forwarding - %s" % session)
                 assert(session)
@@ -291,15 +354,18 @@ class SeleniumRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
                 logger.debug("Profile created at %s" % profile.profile)
                 logger.debug("Creating runner")
-                firefox_binary = body["desiredCapabilities"]['firefoxBinary'] if body["desiredCapabilities"]['firefoxBinary'] else firefox_binary_path()
+                #firefox_binary = body["desiredCapabilities"]['firefoxBinary'] if body["desiredCapabilities"]['firefoxBinary'] else firefox_binary_path()
+                firefox_binary = "/home/ato/dev/inbound/build/desktop-debug/dist/bin/firefox"
                 self.server.runner = FirefoxRunner(profile, firefox_binary)
                 self.server.runner.start()
                 logger.debug("Browser has been started")
-                logger.info("Creating Marionette instance on %s:%s" % ("localhost", port)) 
+                logger.info("Creating Marionette instance on %s:%s" % ("localhost", port))
                 self.server.marionette = Marionette("localhost", port)
                 self.server.marionette.wait_for_port()
                 session = self.server.marionette.start_session()
-                self.send_JSON(session=session, value={})
+                logger.warning("SESSION: %s" % session)
+                available_capabilities = self.server.marionette.session_capabilities
+                self.send_JSON(session=session, value=available_capabilities)
                 # 'value' is the browser capabilities, which we're ignoring for now
             elif path == '/timeouts/async_script':
                 logger.info("Script timeout %s ms - %s" % (body['ms'], session))
@@ -323,18 +389,65 @@ class SeleniumRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 marionette_element = HTMLElement(self.server.marionette, element)
                 assert(marionette_element.send_keys(keys))
                 self.send_JSON(session=session)
-            elif path == '/window':
-                logger.info("Switch to Window %s - %s" % (body['name'], session))
+            elif path == "/window":
+                logger.info("Switch to window %s - %s" % (body["name"], session))
+                assert(self.server.marionette.switch_to_window(body["name"]))
+                self.send_JSON(session=session)
+            elif path.startswith("/window/"):
                 assert(session)
-                assert(self.server.marionette.switch_to_window(body['name']))
+                _, window_handle, action = path.split("/")
+
+                if action == "size":
+                    raise MarionetteException("not supported")
+                elif action == "position":
+                    raise MarionetteException("not supported")
+                elif action == "maximize":
+                    raise MarionetteException("not supported")
+            elif path == "/moveto":
+                logger.info("Move mouse to element by offset %s - %s - %s - %s" %
+                            (body.get("element"), body.get("xoffset"), body.get("yoffset"), session))
+                assert(session)
+
+                element = None
+                if "element" in body:
+                    element = HTMLElement(self.server.marionette, body["element"])
+                xoffset = body.get("xoffset", 0)
+                yoffset = body.get("yoffset", 0)
+                action = gActions(self.server.marionette)
+
+                if element is not None:
+                    action.move(element)
+                action.move_by_offset(xoffset, yoffset)
+                action.perform()
+
+                self.send_JSON(session=session)
+            elif path == "/submit":
+                logger.info("Submitting form - %s - %s" % (element, session))
+                assert(session)
+                marionette_element = HTMLElement(self.server.marionette, element)
+                marionette_element.submit()
+                self.send_JSON(session=session)
+            elif path == "/file":
+                # This is just here to make the endpoint work so that
+                # the tests don't error.  When inteacting with a
+                # remote server, this command is used to upload the
+                # file to the remote so when the subsequent sendKeys
+                # command is sent, the uploaded file is used.
+                #
+                # For drivers running locally (using a local file
+                # detector), such as for desktop, the file path in the
+                # upload field can be set to the local file://
+                # address.
+                logger.info("Uploading file to remote - %s" % session)
+                assert(session)
+                staged_file = body["file"]
                 self.send_JSON(session=session)
             else:
-                logger.error("Unknown path - %s" % session)
+                logger.error("Unknown path - %s" % path)
                 self.file_not_found()
-
         except MarionetteException as e:
-            logger.error("Status: %s - Message: %s" % (e.status, e.message))
-            self.send_JSON(data={'status': e.status}, value={'message': e.message})
+            logger.info("Sending status code - %s - Message: %s" % (e.status, e.message))
+            self.send_JSON(session=session, data={"status":e.status}, value={"message":e.message})
         except:
             trace_ = traceback.format_exc()
             logger.critical("Server Exception: %s" % trace_)
@@ -345,6 +458,7 @@ class SeleniumProxy(object):
     def __init__(self, remote_host='localhost', proxy_port=4444):
         self.remote_host = remote_host
         self.proxy_port = proxy_port
+        self.marionette = None
 
     def start(self):
         logger.info("Starting the Selenium Proxy. Server is running is running on %s:%s" \
@@ -366,7 +480,7 @@ def firefox_binary_path():
     if platform.system() == "Darwin":
         start_cmd = ("/Applications/Firefox.app/Contents/MacOS/firefox-bin")
     elif platform.system() == "Windows":
-        start_cmd = (_find_exe_in_registry() or 
+        start_cmd = (_find_exe_in_registry() or
                      _default_windows_location())
     elif platform.system() == 'Java' and os._name == 'nt':
         start_cmd = _default_windows_location()
@@ -377,7 +491,7 @@ def firefox_binary_path():
                 break
             else:
                 # couldn't find firefox on the system path
-                raise RuntimeError("Could not find firefox in your system PATH." + 
+                raise RuntimeError("Could not find firefox in your system PATH." +
                                    " Please specify the firefox binary location or install firefox")
     return start_cmd
 
